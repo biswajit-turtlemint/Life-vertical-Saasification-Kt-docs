@@ -129,7 +129,7 @@ SachetController.getPolicyIssueStatus()
               │          sortField: "createdAt",
               │          collectionClass: Class.forName(
               │              Constants.getBeanClassName("life", IssuanceResult.class)))
-              │      ← Queries product-specific collection: "life_issuance_result"
+              │      ← Queries product-specific collection: "sachetPolicyDetails"
               │
               │    Catch (class not found):
               │      issuanceResultService.findOneByProperties(properties, "createdAt")
@@ -169,7 +169,7 @@ SachetController.getPolicyIssueStatus()
 
 ## Collection Resolution
 
-`Constants.getBeanClassName("life", IssuanceResult.class)` resolves to the fully qualified class name of the product-specific `IssuanceResult` subclass (e.g., `com.sachetProduct.beans.life.LifeIssuanceResult`), which maps to the `life_issuance_result` MongoDB collection.
+`Constants.getBeanClassName("life", IssuanceResult.class)` resolves to the fully qualified class name of the product-specific `IssuanceResult` subclass (e.g., `com.sachetProduct.beans.life.LifeIssuanceResult`), which maps to the `sachetPolicyDetails` MongoDB collection.
 
 If the class cannot be found (e.g., new product without a specific class), it falls back to the generic `IssuanceResultRepository.findOneByProperties()` which queries the base collection.
 
@@ -179,14 +179,14 @@ If the class cannot be found (e.g., new product without a specific class), it fa
 
 | Function | File | Line | What it does |
 |---|---|---|---|
-| `getPolicyIssueStatus()` (controller) | `SachetController.java` | 460 | Entry point, delegates to service |
-| `fetchPoliciesWithErrorResp()` | `IssuanceServiceV2Impl.java` | 65 | Wraps result with proper error if not found |
-| `getPolicyIssueStatus()` (service) | `IssuanceServiceV2Impl.java` | 92 | Core lookup — routes by query param |
-| `getPolicyIssueStatusByUserId()` | `IssuanceServiceV2Impl.java` | 128 | userId-specific list lookup with optional expired filter |
-| `findOneByPropertiesV2()` | `IssuanceResultRepository` | — | Queries product-specific collection by class |
-| `findOneByProperties()` | `IssuanceResultRepository` | — | Fallback: queries generic collection |
-| `findAllByProperties()` | `IssuanceResultRepository` | — | Returns all policies for a userId |
-| `Constants.getBeanClassName()` | `Constants.java` | — | Resolves product-specific collection class name |
+| `getPolicyIssueStatus()` (controller) | `SachetController.java` | 460 | Entry point: reads `referenceId`, `userId`, `policyNumber`, `isPolicyExpired` query params. Passes all to `issuanceService.fetchPoliciesWithErrorResp()`. Wraps result: `ErrorResponseData` → 400, anything else → 200 |
+| `fetchPoliciesWithErrorResp()` | `IssuanceServiceV2Impl.java` | 65 | Determines the `fieldName` for error messages (referenceId/userId/policyNumber based on which param is present). Calls `getPolicyIssueStatus()`. Post-result checks: `ErrorResponseData` → pass through; `List` that is empty → 400 POLICY_NOT_FOUND; `IssuanceResult` that is blank (all fields null) → 400 POLICY_NOT_FOUND; valid result → return as-is |
+| `getPolicyIssueStatus()` (service) | `IssuanceServiceV2Impl.java` | 92 | Routes by priority: `referenceId` present → `findOneByPropertiesV2({ referenceId: value })`; `policyNumber` present → `findOneByPropertiesV2({ policyNumber: value })`; `userId` present → `getPolicyIssueStatusByUserId()`; none present → 400 MISSING_FIELD. Applies `isPolicyExpired=false` filter (returns empty IssuanceResult if status=EXPIRED) |
+| `getPolicyIssueStatusByUserId()` | `IssuanceServiceV2Impl.java` | 128 | Calls `issuanceResultService.findAllByProperties({ userId, productCode: "life" })` → `Flux<IssuanceResult>` → `collectList()`. If `isPolicyExpired=false`: filters out records where `status == "EXPIRED"`. Returns full list |
+| `findOneByPropertiesV2()` | `IssuanceResultRepository` | — | Tries to resolve the product-specific collection class via `Constants.getBeanClassName("life", IssuanceResult.class)` (resolves to `LifeIssuanceResult` → collection `sachetPolicyDetails`). Queries with `findOne()` sorted by `createdAt` DESC. Catches `ClassNotFoundException` → falls back to `findOneByProperties()` on generic collection |
+| `findOneByProperties()` | `IssuanceResultRepository` | — | Fallback: queries the base/generic issuance result collection using same property map. Used when product-specific class cannot be resolved |
+| `findAllByProperties()` | `IssuanceResultRepository` | — | Returns all matching documents as `Flux<IssuanceResult>`. Used only for `userId` path. Queries with `{ userId, productCode }` filter, no sort |
+| `Constants.getBeanClassName()` | `Constants.java` | — | Resolves the fully-qualified class name of the product-specific `IssuanceResult` subclass (e.g., `com.sachetProduct.beans.life.LifeIssuanceResult`) which Spring Data MongoDB maps to the `sachetPolicyDetails` collection. Returns null / throws `ClassNotFoundException` if no product-specific class exists |
 
 ---
 
@@ -194,9 +194,9 @@ If the class cannot be found (e.g., new product without a specific class), it fa
 
 | System | Collection | Operation | When |
 |---|---|---|---|
-| **MongoDB** | `life_issuance_result` (via `getBeanClassName`) | `findOne` sorted by `createdAt` | By referenceId / policyNumber |
+| **MongoDB** | `sachetPolicyDetails` (via `getBeanClassName`) | `findOne` sorted by `createdAt` | By referenceId / policyNumber |
 | **MongoDB** | Generic issuance collection (fallback) | `findOne` | When class resolution fails |
-| **MongoDB** | `life_issuance_result` | `findAll` filtered by userId + productCode | By userId |
+| **MongoDB** | `sachetPolicyDetails` | `findAll` filtered by userId + productCode | By userId |
 | **Integration Hub** | Not called | — | Never |
 
 ---
