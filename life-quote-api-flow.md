@@ -652,14 +652,14 @@ Priority (lowest → highest, each overwrites previous):
 Before building the mapper, two DB lookups are performed:
 
 **Insurer Constants (`fetchInsurerConstants()`, line 631):**
-- **Collection:** `lifeInsurerProviderMeta`
-- **Query:** `Insurer_Code = insurerCode AND Stage = "PREMIUM" AND Broker = broker`
-- **Returns:** `Constants` field — a map of insurer-specific constant values (e.g., default plan codes, fixed multipliers)
+- **MongoDB Collection:** `lifeInsurerProviderMeta` (`@Document` via `LifeFieldMapper.LifeInsuranceCollections.LIFE_INSURER_PROVIDER_META`)
+- **Query:** `insurerCode = insurerCode AND stage = "PREMIUM" AND broker = broker`
+- **Returns:** `constants` field — `Map<String, Map<String, String>>` of insurer-specific key-value configs (API credentials, agent codes, fixed multipliers)
 
 **Broker Config (`fetchInsurerConfig()`, line 667):**
-- **Collection:** `brokerConfig`
+- **MongoDB Collection:** `brokerConfig` (queried via broker-specific `ReactiveMongoTemplate` from `reactiveMongoTemplateMap`)
 - **Query:** `broker = request.broker`
-- **Returns:** `insurerConfig.{insurerCode}` — broker-level overrides for this insurer
+- **Returns:** `insurerConfig.{insurerCode}` — broker-level overrides (e.g., broker-specific API params for a given insurer)
 
 ---
 
@@ -970,14 +970,14 @@ This is a `Mono.zip()` of 8 parallel enrichments:
 
 | Enrichment | DB/Source | What it adds |
 |-----------|-----------|--------------|
-| `enrichCompanyDetails` | `CompanyDetails` collection | `companyDetails: {InsurerCode, companyName, logo, website, ...}` |
-| `enrichRiderList` | Uses `_preValidatedRiderInfoList` from premiumResponse | `riderList: [...]` — finalized rider list with premium, slab info |
-| `enrichOfferList` | Uses `_preValidatedOfferInfoList` from premiumResponse | `offerList: [...]` |
-| `enrichUlipFundAllocation` | `lifeUlipFundAllocationMaster` collection | `ulipFundAllocation: {...}` |
-| `enrichResponseOptions` | Splits multi-option IH responses | `responseOptions: [...]` |
-| `enrichErrorCategory` | `LifeResponseAttributionRules` collection (vertical=LIFE, stage=QUOTE) | Error categorization fields |
-| `enrichTaxSavingsInfo` | Classpath `income-tax-savings-config.json` + `_preValidatedInBuiltRiderCodes` | `taxSavingsInfo: {...}` |
-| `enrichResultCardsInfo` | Computed from response fields | `resultCardsInfo: {...}` |
+| `enrichCompanyDetails` | MongoDB: `CompanyDetails` collection (query by `insurerCode`) | `companyDetails: {InsurerCode, companyName, logo, website, claimSettlementRatio, solvencyRatio, ...}` |
+| `enrichRiderList` | In-memory: `_preValidatedRiderInfoList` already in premiumResponse (fetched in Step 9 from `lifeRiderMaster`) | `riderList: [...]` — finalized rider list with premium, slab info |
+| `enrichOfferList` | In-memory: `_preValidatedOfferInfoList` already in premiumResponse (fetched in Step 9 from `lifeOfferMaster`) | `offerList: [...]` |
+| `enrichUlipFundAllocation` | MongoDB: `lifeUlipFundAllocationMaster` collection (query by `productCode`) — ULIP plans only | `ulipFundAllocation: {...}` |
+| `enrichResponseOptions` | In-memory: splits multi-option IH responses | `responseOptions: [...]` |
+| `enrichErrorCategory` | MongoDB: `LifeResponseAttributionRules` collection (query by `insurerCode + vertical=LIFE + stage=QUOTE`) | Error categorization fields (`errorCategory`, `errorSubCategory`) |
+| `enrichTaxSavingsInfo` | Classpath: `income-tax-savings-config.json` + `_preValidatedInBuiltRiderCodes` (no DB call) | `taxSavingsInfo: {...}` |
+| `enrichResultCardsInfo` | Computed from response fields (no DB call) | `resultCardsInfo: {...}` |
 
 After `Mono.zip()`:
 - `applyDerivedQuoteFields()` — computes derived fields
@@ -1299,17 +1299,52 @@ enrichLifeQuotesCurrency() → applies currency conversion if needed
 
 ## Database Collections Summary
 
-| Collection | Constant | Purpose | Saved When |
-|------------|----------|---------|-----------|
-| `sachetPremiumRequest` | `DBColConstants.GRID_BASED.QUOTATION_REQUEST` | Stores quote requests | On every POST /quotes call (upsert by referenceId) |
-| `sachetPremiumRequestHistory` | `DBColConstants.GRID_BASED.QUOTATION_REQUEST_HISTORY` | Audit trail of requests | Fire-and-forget after every request save |
-| `sachetPremiumResponse` | `DBColConstants.GRID_BASED.QUOTATION_RESPONSE` | Stores quote results | After each IH call completes |
-| `sachetLifeRiderPrices` | `DBColConstants.GRID_BASED.LIFE_RIDER_PRICES` | Rider price combinations | Async after successful quote (non-single-result) |
-| `CompanyDetails` | (external) | Insurer company details | Read-only (master data) |
-| `lifeRiderMaster` | (external) | Rider master definitions | Read-only (master data) |
-| `lifeOfferMaster` | (external) | Offer master definitions | Read-only (master data) |
-| `lifeUlipFundAllocationMaster` | (external) | ULIP fund allocation | Read-only (master data) |
-| `LifeResponseAttributionRules` | (external) | Error categorization rules | Read-only (master data) |
+### Write Collections (transactional data)
+
+| Collection | Constant | Purpose | When Written |
+|------------|----------|---------|--------------|
+| `sachetPremiumRequest` | `DBColConstants.GRID_BASED.QUOTATION_REQUEST` | Stores quote requests | Every POST /quotes call (upsert by referenceId) |
+| `sachetPremiumRequestHistory` | `DBColConstants.GRID_BASED.QUOTATION_REQUEST_HISTORY` | Audit trail of all request saves | Fire-and-forget after every request save |
+| `sachetPremiumResponse` | `DBColConstants.GRID_BASED.QUOTATION_RESPONSE` | Stores enriched quote results per insurer | After each IH call completes (one doc per insurer) |
+| `sachetLifeRiderPrices` | `DBColConstants.GRID_BASED.LIFE_RIDER_PRICES` | Pre-computed rider price combinations per plan | Async after successful non-single-result quote |
+
+### Read-Only Collections (master / config data — MongoDB)
+
+| Collection | Query Key | Purpose | Step Used |
+|------------|-----------|---------|-----------|
+| `lifeRiderMaster` | `riderCode IN codes + insurerCode + currency` | Rider master definitions — slab ranges, isSelected flags, categories | Step 9 (pre-enrichment before IH call) |
+| `lifeOfferMaster` | `offerCode IN codes + insurerCode` | Offer master definitions | Step 9 (pre-enrichment before IH call) |
+| `lifeInsurerProviderMeta` | `insurerCode + stage="PREMIUM" + broker` | Insurer-specific API constants (credentials, fixed params) needed for IH scope | Step 11 (`fetchInsurerConstants()` — building IH scope) |
+| `brokerConfig` | `broker` | Broker-level insurer overrides (`insurerConfig.{insurerCode}`) | Step 11 (`fetchInsurerConfig()` — uses broker-specific ReactiveMongoTemplate) |
+| `CompanyDetails` | `insurerCode` | Insurer company details (name, logo, CSR, solvency ratio) | Step 13 (`enrichCompanyDetails()` — post-IH enrichment) |
+| `lifeUlipFundAllocationMaster` | `productCode` | ULIP fund allocation options | Step 13 (`enrichUlipFundAllocation()` — ULIP plans only) |
+| `LifeResponseAttributionRules` | `insurerCode + vertical=LIFE + stage=QUOTE` | Error categorization rules for response attribution | Step 13 (`enrichErrorCategory()`) |
+
+---
+
+## Database / External Calls
+
+| System | Collection / Endpoint | Operation | When |
+|---|---|---|---|
+| **MongoDB** | `sachetPremiumRequest` | Read — load stored request on modify/requote (by `referenceId`) | Non-initial calls (referenceId already exists) |
+| **MongoDB** | `sachetPremiumRequest` | Write — upsert quote request (by `referenceId`) | Every POST /quotes call |
+| **MongoDB** | `sachetPremiumRequestHistory` | Write — fire-and-forget audit copy | After every request save |
+| **MongoDB** | `sachetPremiumResponse` | Write — persist enriched quote result per insurer | After each IH premium call completes |
+| **MongoDB** | `sachetPremiumResponse` | Read — fetch results for poll/GET response | Step 16 (GET /quotes, /poll) |
+| **MongoDB** | `sachetLifeRiderPrices` | Write — store pre-computed rider price combinations | Async after successful non-single-result quote (Step 14) |
+| **MongoDB** | `lifeRiderMaster` | Read — rider definitions by `riderCode + insurerCode + currency` | Step 9 — pre-enrichment for each insurer request |
+| **MongoDB** | `lifeOfferMaster` | Read — offer definitions by `offerCode + insurerCode` | Step 9 — pre-enrichment for each insurer request |
+| **MongoDB** | `lifeInsurerProviderMeta` | Read — insurer API constants by `insurerCode + stage="PREMIUM" + broker` | Step 11 — building IH scope (`fetchInsurerConstants()`) |
+| **MongoDB** | `brokerConfig` | Read — broker-level insurer overrides by `broker` | Step 11 — building IH scope (`fetchInsurerConfig()`) |
+| **MongoDB** | `CompanyDetails` | Read — insurer info by `insurerCode` | Step 13 — post-IH enrichment (`enrichCompanyDetails()`) |
+| **MongoDB** | `lifeUlipFundAllocationMaster` | Read — fund allocation by `productCode` | Step 13 — post-IH enrichment, ULIP plans only |
+| **MongoDB** | `LifeResponseAttributionRules` | Read — error rules by `insurerCode + vertical=LIFE + stage=QUOTE` | Step 13 — post-IH enrichment (`enrichErrorCategory()`) |
+| **Redis** | `LifeProductCatalogue_<broker>` (TTL: 4h) | Read — product catalogue cache | Step 4 — cache hit skips IH Product Management call |
+| **IH Product Management API** | `POST /api/product-management/v1/products/details/filters` | Read — all broker-configured life products + PDP fields | Step 4 — on Redis cache miss only |
+| **IH Life Validator API** | `POST /api/product-management/v1/life-validator` | Read — nearest valid PT/PPT/score per product for user inputs | Step 6 — every request (not cached) |
+| **Rule Engine** | `POST {rule-engine.base-url}/api/rules/v0/life/riders/slab` | Read — rider slab ranges (min/max SA, premium, applicable terms) | Step 9 — per insurer, if `showRider=true` |
+| **Rule Engine** | `POST {rule-engine.base-url}/api/rules/v0/life/riders/validate` | Read — rider validity + resolved slab per rider | Step 9 — per insurer, if `showRider=true` |
+| **Integration Hub** | Insurer premium endpoint (`TMRequestType.PREMIUM_REQUEST`) | POST — compute premium for each insurer product | Step 10 — async per insurer (parallel) |
 
 ---
 
@@ -1682,6 +1717,7 @@ POST /api/minterprise/v2/products/life/quotes
 
 ---
 
+*This document was generated from source code analysis of the `minterprise` codebase.*
 
 *Key files:*
 - *`SachetController.java` — API entry point (GET + POST endpoints)*
