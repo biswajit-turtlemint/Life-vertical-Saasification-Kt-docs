@@ -163,14 +163,16 @@ LookupController.validatePincodes()
 
 | Function | File | Line | What it does |
 |---|---|---|---|
-| `validatePincodes()` (controller) | `LookupController.java` | 114 | Entry point, delegates to `PincodeUtils` |
-| `validatePincodes()` (util) | `PincodeUtils.java` | 55 | Routes to new or legacy path based on productCode |
-| `newPincodesValdiator()` | `PincodeUtils.java` | 65 | Guards + routes between insurer vs generic lookup |
-| `fetchPincodesByInsurer()` | `PincodeUtils.java` | 86 | Sequential per-pincode POST to insurer LOCATION master |
-| `fetchGenericPincodes()` | `PincodeUtils.java` | 114 | Single GET to TM generic pincode master (first pincode only) |
-| `buildPincodeFilterRequest()` | `PincodeUtils.java` | 163 | Builds `filterGroup` request body |
-| `mapLifePincodeMasterRow()` | `PincodeUtils.java` | 219 | Normalizes master response row to `{ city, pincode, state }` |
-| `resolveMasterServiceBroker()` | `PincodeUtils.java` | 135 | Always returns `"turtlemint"` |
+| `validatePincodes()` (controller) | `LookupController.java` | 114 | Entry point: reads `x-broker` header, reads raw JSON body as a map (no `PayloadWrapper`), extracts `pincodes[]` and `insurer` fields, delegates to `PincodeUtils.validatePincodes()`, wraps result in `PayloadWrapper.generateResponse()` |
+| `validatePincodes()` (util) | `PincodeUtils.java` | 55 | Routes based on `productCode`: for `"life"` or `"health"` calls `newPincodesValdiator()`; for other products calls legacy `pincodeValidateURL` (POST to old path) |
+| `newPincodesValdiator()` | `PincodeUtils.java` | 65 | Guards: `pincodes` null/empty → return `[]`; `masterServiceV2Host` or `ihApiKey` blank → return `[]` (logs warning). Calls `resolveMasterServiceBroker()` (always returns `"turtlemint"`). Routes: if `insurer` present → `fetchPincodesByInsurer()`; else → `fetchGenericPincodes()` |
+| `resolveMasterServiceBroker()` | `PincodeUtils.java` | 135 | Always returns the hardcoded string `"turtlemint"` regardless of the `x-broker` header. This is intentional — Master Service v2 uses turtlemint as the canonical broker for LOCATION master lookups |
+| `fetchPincodesByInsurer()` | `PincodeUtils.java` | 86 | Uses `Flux.concatMap` to query Master Service v2 **sequentially** for each pincode (one call per pincode). For each: calls `buildPincodeFilterRequest()` to create the filter body, POSTs to `/api/v2/masters/turtlemint/insurer/{INSURER_UPPER}/LOCATION/LIFE/filter-with-query`. Calls `extractMasterServiceDataAsList()` (reads `response.data`). Maps each row via `mapLifePincodeMasterRows()`. Collects and flattens all results |
+| `fetchGenericPincodes()` | `PincodeUtils.java` | 114 | Only queries the **first pincode** in the list. GETs `/api/v2/masters/turtlemint/LOCATION/LIFE/filter?pincode={pincode}`. Calls `extractFirstMasterServiceDataRow()` (takes first item of `response.data`). Maps via `mapLifePincodeMasterRow()` |
+| `buildPincodeFilterRequest()` | `PincodeUtils.java` | 163 | Constructs the filter body: `{ filterGroup: { combinator: "and", rules: [{ field: "pincode", operator: "=", value: "<pincode>" }] } }`. This is Master Service v2's filter-with-query DSL format |
+| `extractMasterServiceDataAsList()` | `PincodeUtils.java` | — | Reads `response.data` as a `List`. Returns empty list if response is null or `data` key is missing |
+| `mapLifePincodeMasterRows()` | `PincodeUtils.java` | — | Iterates master rows and calls `mapLifePincodeMasterRow()` on each. Collects into a flat list |
+| `mapLifePincodeMasterRow()` | `PincodeUtils.java` | 219 | Normalizes one master row to `{ city, pincode, state }`. Tries multiple key names: city from `city` / `cityCode` / `city_code`; state from `state` / `stateCode` / `state_code`. Returns empty list if row is blank |
 
 ---
 
