@@ -131,12 +131,12 @@ VerticalController.createBITimeLine()
               ├─[referenceId present]
               │    quotationResultMono =
               │      quotationService.fetchResultFromDB("life", referenceId, quoteId, null)
-              │      MongoDB: grid_based_quotation_result
+              │      MongoDB: sachetPremiumResponse
               │
               └─[premiumResultId present]
                    quotationResultMono =
                      quotationResultRepository.findById(premiumResultId)
-                     MongoDB: grid_based_quotation_result (by _id)
+                     MongoDB: sachetPremiumResponse (by _id)
                      → NoRecordFoundException if not found
               │
               └─ quotationResultMono.flatMap(quotationResult → )
@@ -171,7 +171,7 @@ VerticalController.createBITimeLine()
                    │    │    → ulipFundAllocation { ... } (ULIP plans only)
                    │    │
                    │    ├─ enrichResponseOptions(baseResponse)
-                   │    │    MongoDB: grid_based_quotation_result (responseOptions)
+                   │    │    MongoDB: sachetPremiumResponse (responseOptions)
                    │    │    → responseOptions [ { variant quotes } ]
                    │    │
                    │    ├─ enrichErrorCategory(insurerCode)
@@ -215,16 +215,19 @@ VerticalController.createBITimeLine()
 
 | Function | File | Line | What it does |
 |---|---|---|---|
-| `createBITimeLine()` (controller) | `VerticalController.java` | 36 | Entry point, parses `BITimeLineRequest`, delegates |
-| `createBITimeLine()` (service) | `VerticalServiceImpl.java` | — | Routes to correct product aggregator |
-| `createBITimeLine()` (aggregator) | `SachetLifeAggregator.java` | 3345 | Core logic — validation, DB fetch, enrichment, image gen |
-| `resolveSelectedLifeQuotePayload()` | `SachetLifeAggregator.java` | — | Extracts matching quote Map from `QuotationResult` |
-| `enrichQuoteResponse()` | `LifeQuoteMasterDataEnrichmentService.java` | 98 | Enriches quote with master data (company, riders, offers, ULIP, etc.) |
-| `enrichCompanyDetails()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Fetches insurer company details from MongoDB |
-| `enrichRiderList()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Fetches rider master data for the insurer |
-| `enrichOfferList()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Fetches active offers for the insurer |
-| `enrichUlipFundAllocation()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Fetches ULIP fund allocation master (ULIP plans only) |
-| `generateLifeBITimelineFile()` | `SachetLifeAggregator.java` | 3431 | Builds template request and calls Template Generator |
+| `createBITimeLine()` (controller) | `VerticalController.java` | 36 | Entry point: unwraps `PayloadWrapper.data` → `BITimeLineRequest`, delegates to `VerticalServiceImpl`, maps error/success response |
+| `createBITimeLine()` (service) | `VerticalServiceImpl.java` | 27 | Thin delegation: calls `ISachetProductAggregatorFactory.getPremiumAggregator("life")` → `SachetLifeAggregator.createBITimeLine()` |
+| `createBITimeLine()` (aggregator) | `SachetLifeAggregator.java` | 3344 | Core logic: guards (quoteId, referenceId) → DB fetch (two paths: by referenceId or premiumResultId) → `resolveSelectedLifeQuotePayload()` → strip responseOptions → `enrichQuoteResponse()` → `generateLifeBITimelineFile()` |
+| `resolveSelectedLifeQuotePayload()` | `SachetLifeAggregator.java` | — | Extracts the matching quote as `Map<String,Object>` from the `QuotationResult` document. Matches `quoteId` against the root entry and each `responseOptions[]` variant by checking `_id`, `quoteId`, `insurerQuoteId`, `resultId`. Returns empty map if not found |
+| `enrichQuoteResponse()` | `LifeQuoteMasterDataEnrichmentService.java` | 98 | Runs 7 parallel enrichments via `Mono.zip`. Adds master data onto the quote map before it is sent to the template renderer. The `true` parameter means ULIP fund allocation is included |
+| `enrichCompanyDetails()` | `LifeQuoteMasterDataEnrichmentService.java` | — | MongoDB `CompanyDetails` collection: queries by `insurerCode`. Adds `companyDetails` map to quote (includes `insurerName`, `claimSettlementRatio`, `solvencyRatio`, `freelookPeriod`, `lifeCompanyDetails`) |
+| `enrichRiderList()` | `LifeQuoteMasterDataEnrichmentService.java` | — | MongoDB `lifeRiderMaster`: queries by `insurerCode`. Adds `riderList[]` to quote for the template to render available rider info |
+| `enrichOfferList()` | `LifeQuoteMasterDataEnrichmentService.java` | — | MongoDB `lifeOfferMaster`: queries by `insurerCode`, filters active offers. Adds `offerList[]` to quote |
+| `enrichUlipFundAllocation()` | `LifeQuoteMasterDataEnrichmentService.java` | — | MongoDB `lifeUlipFundAllocationMaster`: queries by `productCode`. Adds `ulipFundAllocation` to quote — only populated for ULIP-type plans |
+| `enrichErrorCategory()` | `LifeQuoteMasterDataEnrichmentService.java` | — | MongoDB `LifeResponseAttributionRules`: queries by `insurerCode + stage=QUOTE`. Patches `errorCategory` and `errorSubCategory` onto the quote for error attribution context |
+| `enrichTaxSavingsInfo()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Computed (no DB call): derives tax savings info from the quote's premium/coverage fields → adds `taxSavingsInfo` map to quote |
+| `enrichResultCardsInfo()` | `LifeQuoteMasterDataEnrichmentService.java` | — | Computed (no DB call): derives result card summary fields (death benefit, maturity benefit labels, etc.) from quote → adds `resultCardsInfo` map |
+| `generateLifeBITimelineFile()` | `SachetLifeAggregator.java` | 3431 | Builds the Template Generator request: `template="LIFE_BI_TIMELINE_TEMPLATE"`, `fileType="image"`, `fileOptions={format:"jpeg", height:100, width:330}`, `data=enrichedQuote`. Strips `responseOptions` again before sending. Calls `templateGeneratorUtil.generateTemplate()` → returns `{fileName, fileId}` |
 
 ---
 
@@ -232,7 +235,7 @@ VerticalController.createBITimeLine()
 
 | System | Collection / Endpoint | Operation | When |
 |---|---|---|---|
-| **MongoDB** | `grid_based_quotation_result` | Read — by `referenceId + quoteId` or by `_id` | Always |
+| **MongoDB** | `sachetPremiumResponse` | Read — by `referenceId + quoteId` or by `_id` | Always |
 | **MongoDB** | `CompanyDetails` | Read — by `insurerCode` | Always (enrichment) |
 | **MongoDB** | `lifeRiderMaster` | Read — by `insurerCode` | Always (enrichment) |
 | **MongoDB** | `lifeOfferMaster` | Read — by `insurerCode` | Always (enrichment) |
