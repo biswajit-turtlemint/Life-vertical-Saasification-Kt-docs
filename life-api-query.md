@@ -238,12 +238,49 @@ SachetController.getLifeProductsQuery()
        │     Else → []
        │
        ├─ LifeRequestValidationService.resolveValidatedProviders(request, providers)
-       │     └─► Integration Hub API call
-       │           Fetches configured life product rows for broker
-       │           Filtered by provider if specified
-       │           Returns LifeValidationResult {
-       │             rowsByProvider: Map<String, List<Map<String, Object>>>
-       │           }
+       │     │
+       │     ├─ normalizeLifeRequestForValidation()
+       │     │     Extracts planDetails, riskInsured.insuredMembers[0], proposerDetails
+       │     │     Derives entryAge from DOB if not set; derives maturityAge/policyTerm/PPT
+       │     │     Derives investmentTermCode (short/medium/long) from policyTerm
+       │     │
+       │     ├─ [IH Call 1] fetchEnabledProductsFromIntegrationHub(broker)
+       │     │     LifeProductCatalogueService.fetchProductDetails(broker)
+       │     │     ├─ Redis cache check (key: "LifeProductCatalogue_<broker>", TTL: 4h)
+       │     │     │     Cache hit → return cached product list
+       │     │     └─ Cache miss → IH Product Management API
+       │     │           POST /api/product-management/v1/products/details/filters
+       │     │           → List<ProductDetailsResponse> (all products for broker)
+       │     │           → normalizeProductDetailRows(): flattens PDP fields per variant
+       │     │              (planType, optionCode, payoutTypes, planFeatureList, riders, etc.)
+       │     │           → cached in Redis for 4h
+       │     │
+       │     ├─ Filter enabled product rows:
+       │     │     - matchesPlanType (if planType specified)
+       │     │     - matchesPolicyType (if planType absent)
+       │     │     - matchesCategories (categoryTags must contain all requested categories)
+       │     │     - matchesPaymentFrequency (paymentFrequencyModes)
+       │     │     - matchesCurrency
+       │     │     - matchesSelectedPlans (if selectedPlans in body)
+       │     │     - matchesInsurer (if x-provider header set)
+       │     │
+       │     ├─ applyLifePostFiltersWithDefaults()
+       │     │     - applyPayoutDefaults (turtlemint broker only — sets default payoutType)
+       │     │     - filterByPayoutSettings (payoutType, payoutTerm, payoutFrequency)
+       │     │     - filterByPlanFeatures (jointLife, returnOfPremium flags)
+       │     │
+       │     ├─ createLifeValidatorRows()
+       │     │     Transforms product master rows into validator row format
+       │     │     Injects entryAge, paymentFrequency, maturityAge, policyTerm, PPT from request
+       │     │
+       │     └─ [IH Call 2] applyNearestMatch()
+       │           POST /api/product-management/v1/life-validator
+       │           Sends: productCodes[], scope { entryAge, policyTerm, PPT, ... }
+       │           Returns: per-product nearest valid policyTerm + premiumPaymentTerm + score
+       │           Products with no match are dropped (score=0 means exact match, kept as-is)
+       │           Not cached — called on every request
+       │
+       │     Groups surviving rows by insurerCode → LifeValidationResult { rowsByProvider }
        │
        └─ toLifeProductQueryResponse(validationResult)
              │
@@ -272,23 +309,37 @@ SachetController.getLifeProductsQuery()
 
 | Function | File | Line | What it does |
 |---|---|---|---|
-| `getLifeProductsQuery()` | `SachetController.java` | 152 | Entry point, validates body, injects context, delegates |
-| `getLifeProducts()` | `LifeProductQueryService.java` | 26 | Orchestrates validation + response building |
-| `buildConfiguredProviders()` | `LifeProductQueryService.java` | 37 | Wraps `x-provider` header into provider list |
-| `resolveValidatedProviders()` | `LifeRequestValidationService.java` | — | Calls IH to get configured provider-product rows |
-| `toLifeProductQueryResponse()` | `LifeProductQueryService.java` | 48 | De-dups and merges rows into response objects |
-| `mergeResponseFields()` | `LifeProductQueryService.java` | 97 | Appends income terms, payout types, deferment periods |
-| `mergePlanFeatures()` | `LifeProductQueryService.java` | 116 | Sets `jointLife` / `returnOfPremium` flags |
-| `applyFeatureCode()` | `LifeProductQueryService.java` | 141 | Normalizes feature code and flips boolean flags |
+| `getLifeProductsQuery()` | `SachetController.java` | 156 | Entry point: deserializes body into `QuotationRequest`, injects productCode/tenant/broker/partnerId/provider from headers, runs on `boundedElastic` scheduler (blocking-safe), wraps result in `PayloadWrapper.success()` |
+| `getLifeProducts()` | `LifeProductQueryService.java` | 26 | Guard: returns `[]` if productCode is not `"life"`. Builds configured providers list, calls `resolveValidatedProviders`, then calls `toLifeProductQueryResponse` to transform rows |
+| `buildConfiguredProviders()` | `LifeProductQueryService.java` | 37 | Wraps `x-provider` header value into `[{"provider": "<value>"}]`. Returns empty list if header absent — meaning: include all configured providers |
+| `resolveValidatedProviders()` | `LifeRequestValidationService.java` | 49 | Full product validation pipeline: normalize request → fetch enabled products (IH + Redis) → filter by plan/category/frequency → apply payout defaults → nearest-match (IH) → group by provider. Returns `LifeValidationResult { rowsByProvider }` |
+| `resolveLifePremiumRequest()` | `LifeRequestValidationService.java` | 182 | Extracts `planDetails` map from the full `premiumRequest`. This is the canonical source for planType, categories, coverAmount, PPT, etc. |
+| `normalizeLifeRequestForValidation()` | `LifeRequestValidationService.java` | 192 | Merges planDetails + riskInsured.insuredMembers[0] (age, gender, DOB) + proposerDetails into a flat map. Calls `applyLifeDefaultDerivations()` to fill in missing age/maturityAge/policyTerm/PPT/investmentTermCode |
+| `applyLifeDefaultDerivations()` | `LifeRequestValidationService.java` | 235 | Derives entryAge from DOB if not present. Derives maturityAge from age+PT or age-based defaults per category (term→65/75, retirement→100, whole-life→95). Derives PT from maturityAge-entryAge. Derives PPT from PT. Sets investmentTermCode (short/medium/long) based on PT |
+| `fetchEnabledProductsFromIntegrationHub()` | `LifeRequestValidationService.java` | 622 | Calls `LifeProductCatalogueService.fetchProductDetails(broker)`. Checks Redis cache first (TTL: 4h). On cache miss → calls IH Product Management API `POST /api/product-management/v1/products/details/filters`. Normalizes response via `normalizeProductDetailRows()` |
+| `normalizeProductDetailRows()` | `LifeRequestValidationService.java` | 635 | Flattens PDP field definitions into a plain map per product variant. Handles two shapes: base PDP (shared across all variants) and variant-scoped PDP. Each output row contains: productCode, insurerCode, optionCode, planType, payoutTypes, planFeatureList, riders, etc. |
+| `fetchEnabledProductMasters()` | `LifeRequestValidationService.java` | 578 | Applies 6 sequential filters to normalized rows: planType, policyType (when no planType), categories (categoryTags), paymentFrequency (paymentFrequencyModes), currency, selectedPlans, insurerCode filter |
+| `applyLifePostFiltersWithDefaults()` | `LifeRequestValidationService.java` | 346 | Applies post-catalogue filters: `applyPayoutDefaults` (turtlemint only — sets payoutType from first matching product if not in request), `filterByPayoutSettings` (payoutType + payoutTerm + payoutFrequency), `filterByPlanFeatures` (jointLife, returnOfPremium) |
+| `createLifeValidatorRows()` | `LifeRequestValidationService.java` | 884 | Transforms enabled product master rows into validator row format. Adds user's entryAge, paymentFrequency, maturityAge, defaultPolicyTerm, defaultPPT from the normalized request onto each row |
+| `applyNearestMatch()` | `LifeRequestValidationService.java` | 986 | Calls `fetchNearestMatchMap()` → IH Life Validator `POST /api/product-management/v1/life-validator`. Sends all internalProductCodes + validation scope (entryAge, policyTerm, PPT, coverage, planType). IH returns nearest valid PT/PPT per product. Products with no matching entry are dropped. Updates rows with nearest policyTerm + premiumPaymentTerm + score |
+| `fetchNearestMatchMap()` | `LifeRequestValidationService.java` | 1093 | HTTP POST to IH `/api/product-management/v1/life-validator` with `x-api-key` header. Parses response: for each product, picks the option with score=0 (exact match) or lowest-score nearest match. Returns Map of `internalProductCode[-optionCode]` → `NearestMatchValue { policyTerm, premiumPaymentTerm, score }` |
+| `toLifeProductQueryResponse()` | `LifeProductQueryService.java` | 48 | Iterates all rows per provider. De-duplicates using key `insurerCode|productCode`. First occurrence → `initializeResponse()` (base fields). Subsequent rows → `mergeResponseFields()` to union values |
+| `initializeResponse()` | `LifeProductQueryService.java` | 87 | Creates new `LifeProductQueryResponse`. Sets productCode, productName, insurerCode, insurerName (falls back to insurerCode if missing), planType |
+| `mergeResponseFields()` | `LifeProductQueryService.java` | 97 | Unions into existing response: `incomeTerms` (from `payoutBenefitTerms` + `payoutTerm`), `payoutTypes` (normalized uppercase), `defermentPeriods` (from `defermentPeriod` + `calculatedDefermentPeriod`). Calls `mergePlanFeatures()` |
+| `mergePlanFeatures()` | `LifeProductQueryService.java` | 116 | Reads `planFeatureList[]` first (each entry: `code` + `active` flag; skips inactive). Falls back to `planFeatureDetailsList[]` if `planFeatureList` is empty. Calls `applyFeatureCode()` for each entry |
+| `applyFeatureCode()` | `LifeProductQueryService.java` | 141 | Normalizes feature code (lowercase, strip `_`, `-`, spaces). Sets `jointLife=true` if code is `"jointlife"`; sets `returnOfPremium=true` if code is `"returnofpremium"` |
+| `normalizePayoutTypes()` | `LifeProductQueryService.java` | 155 | Trims and uppercases each payout type string (e.g., `"lump_sum"` → `"LUMP_SUM"`) |
 
 ---
 
 ## Database / External Calls
 
-| System | What | When |
-|---|---|---|
-| **Integration Hub** | Fetch configured providers & product master rows for broker | Always |
-| **MongoDB** | Not used | — |
+| System | Endpoint / Key | Operation | When |
+|---|---|---|---|
+| **Redis** | `LifeProductCatalogue_<broker>` (TTL: 4h) | Read — product catalogue cache | Every request (cache hit avoids IH call) |
+| **IH Product Management API** | `POST /api/product-management/v1/products/details/filters` | Read — fetch all products + PDP data for broker | On Redis cache miss |
+| **IH Life Validator API** | `POST /api/product-management/v1/life-validator` | Read — nearest-match PT/PPT/score per product | Every request (not cached) |
+| **MongoDB** | — | Not used | Never |
 
 ---
 
