@@ -161,7 +161,7 @@ All three APIs run this flow first. The PDF and share APIs branch after step 5.
 
 2. fetchQuoteRowsForComparison(referenceId)
    └─ quotationService.fetchLifeQuotesFromDBForComparison(referenceId)
-        MongoDB: grid_based_quotation_result
+        MongoDB: sachetPremiumResponse
         Returns raw quote rows (Map<String,Object>) for the session
 
 3. resolveSelectedPlans(selectedPlans, quoteRows)
@@ -177,7 +177,7 @@ All three APIs run this flow first. The PDF and share APIs branch after step 5.
    │
    ├─ a. fetchLifeProductMasters(broker)
    │       LifeProductCatalogueService.fetchProductMasters(broker)
-   │       MongoDB: life_product_catalogue_master
+   │       IH Product Management API → `/detail-config` (Redis-cached 4h)
    │       → Map<"productCode|optionCode", LifeProductCatalogueMaster>
    │         Contains: minEntryAge, maxEntryAge, minPpt, maxPpt,
    │                   sumAssuredLimitOnDeath, maturityAge, payoutTypes,
@@ -185,7 +185,7 @@ All three APIs run this flow first. The PDF and share APIs branch after step 5.
    │
    ├─ b. fetchFeatureMap(productMasterMap, resolvedPlans)
    │       Collects all specialFeature IDs from masters of resolved plans
-   │       MongoDB: life_product_special_features
+   │       MongoDB: lifeProductSpecialFeatures
    │         Query: { _id: { $in: [featureIds] } }
    │       Sorts each plan's features by priority (asc, nulls last),
    │         then by displayText (asc, case-insensitive)
@@ -528,9 +528,9 @@ Core comparison flow (same as /compare-plans)
 
 | System | Collection / Endpoint | Operation | Used by |
 |---|---|---|---|
-| **MongoDB** | `grid_based_quotation_result` | Read — fetch quote rows by referenceId | All 3 |
-| **MongoDB** | `life_product_catalogue_master` | Read — product master by productCode+optionCode | All 3 |
-| **MongoDB** | `life_product_special_features` | Read — `_id IN featureIds` | All 3 |
+| **MongoDB** | `sachetPremiumResponse` | Read — fetch quote rows by referenceId | All 3 |
+| **IH Product Management API** | `/detail-config` (Redis-cached 4h) | Read — product master by productCode+optionCode | All 3 |
+| **MongoDB** | `lifeProductSpecialFeatures` | Read — `_id IN featureIds` | All 3 |
 | **SachetLifeAggregator** | `/rider/prices` (internal call) | Read — rider prices per plan key | All 3 |
 | **Partner Service** | Partner details by partnerId | Read | All 3 |
 | **Template Generator Service** | `LIFE_PLANS_COMPARE` template | POST — render PDF | PDF + Share |
@@ -544,28 +544,28 @@ Core comparison flow (same as /compare-plans)
 
 | Function | File | Line | What it does |
 |---|---|---|---|
-| `comparePlans()` (controller) | `SachetController.java` | 676 | Validates product support, delegates to aggregator |
-| `getPlanComparisonPdf()` (controller) | `SachetController.java` | 734 | Validates PDF support, delegates to aggregator |
-| `sharePlanComparison()` (controller) | `SachetController.java` | 792 | Validates share support, delegates to aggregator |
-| `comparePlans()` (aggregator) | `SachetLifeAggregator.java` | 947 | Input validation, delegates to service |
-| `sharePlanComparison()` (aggregator) | `SachetLifeAggregator.java` | 1028 | Input validation, delegates to service |
-| `comparePlans()` (service) | `PlanComparisonServiceImpl.java` | 112 | Core comparison logic |
-| `generatePlanComparisonPdf()` (service) | `PlanComparisonServiceImpl.java` | 193 | Calls comparison + triggers PDF generation |
-| `sharePlanComparison()` (service) | `PlanComparisonServiceImpl.java` | 164 | Calls comparison + preview + email |
-| `fetchQuoteRowsForComparison()` | `PlanComparisonServiceImpl.java` | 210 | Loads quote rows from MongoDB |
-| `resolveSelectedPlans()` | `PlanComparisonServiceImpl.java` | 1167 | Matches selectedPlans to DB rows by quoteId/resultId/product |
-| `fetchLifeProductMasters()` | `PlanComparisonServiceImpl.java` | 226 | Loads `LifeProductCatalogueMaster` map |
-| `fetchFeatureMap()` | `PlanComparisonServiceImpl.java` | 246 | Loads and sorts `LifeProductSpecialFeature` per plan |
-| `fetchRiderPrices()` | `PlanComparisonServiceImpl.java` | 310 | Fetches rider pricing for addons section |
-| `fetchPartnerDetails()` | `PlanComparisonServiceImpl.java` | 334 | Loads partner info for branding |
-| `buildResponse()` | `PlanComparisonServiceImpl.java` | 543 | Assembles full `PlanComparisonResponse` |
-| `buildPlanResultInfo()` | `PlanComparisonServiceImpl.java` | 588 | Builds per-plan result with all sections |
-| `buildPlanSections()` | `PlanComparisonServiceImpl.java` | 687 | Creates the 5 comparison sections per plan |
-| `populateKeyFeatureSections()` | `PlanComparisonServiceImpl.java` | 872 | Fills icon-type key features across all plans |
-| `filterPlanResultSections()` | `PlanComparisonServiceImpl.java` | 922 | Filters to selectedAttributes if provided |
-| `buildPlanSectionRows()` | `PlanComparisonServiceImpl.java` | 946 | Transposes to row format for UI grid |
-| `buildAttachments()` | `PlanComparisonServiceImpl.java` | 415 | Downloads PDF + Base64 encodes for email |
-| `buildShareNotificationRequest()` | `PlanComparisonServiceImpl.java` | 439 | Builds email notification payload |
+| `comparePlans()` (controller) | `SachetController.java` | 676 | Checks `aggregator.supportsPlanComparison()` → `true` for life. Reads headers (tenant/broker/partnerId/vertical), passes raw `@RequestBody` to aggregator |
+| `getPlanComparisonPdf()` (controller) | `SachetController.java` | 734 | Checks `aggregator.supportsPlanComparisonPdf()` → `true` for life. Same header extraction, delegates to aggregator |
+| `sharePlanComparison()` (controller) | `SachetController.java` | 792 | Checks `aggregator.supportsPlanComparisonShare()` → `true` for life. Same delegation pattern |
+| `comparePlans()` (aggregator) | `SachetLifeAggregator.java` | 947 | Validates: `requestId` not blank, `selectedPlans` not empty, each plan has `quoteId OR resultId OR (productCode + optionCode)`. Uses `resolvePartnerId()` (prefers header over body). Delegates to `planComparisonService.comparePlans()` |
+| `sharePlanComparison()` (aggregator) | `SachetLifeAggregator.java` | 1028 | Same validations as comparePlans aggregator, but on `shareRequest.planComparisonRequest`. Delegates to `planComparisonService.sharePlanComparison()` |
+| `comparePlans()` (service) | `PlanComparisonServiceImpl.java` | 112 | Orchestrates all 5 steps: fetch quote rows → resolve plans → parallel data fetch (masters + features + riders + partner) → buildResponse. Returns `PlanComparisonResponse` |
+| `generatePlanComparisonPdf()` (service) | `PlanComparisonServiceImpl.java` | 193 | Calls `comparePlans()` to get comparison data, then builds PDF template request (`LIFE_PLANS_COMPARE`, A4 portrait, header height 0, footer with page numbers + turtlemint logo). Calls `templateGeneratorUtil.generateTemplate()`. Returns `{fileId, fileName, url}` |
+| `sharePlanComparison()` (service) | `PlanComparisonServiceImpl.java` | 164 | Calls `comparePlans()`, then generates preview JPEG image (`LIFE_PLANS_COMPARE_PREVIEW`, 600px wide), downloads PDF bytes from File Service (base64 encodes for attachment), builds notification email payload, calls Notification Service |
+| `fetchQuoteRowsForComparison()` | `PlanComparisonServiceImpl.java` | 210 | Calls `quotationService.fetchLifeQuotesFromDBForComparison(referenceId)` → queries `sachetPremiumResponse` for all documents with matching `referenceId`. Returns raw rows as `List<Map<String,Object>>` |
+| `resolveSelectedPlans()` | `PlanComparisonServiceImpl.java` | 1167 | For each plan in `selectedPlans`: searches all quote rows and their `responseOptions[]` variants. Priority: match `quoteId` against `_id`, `quoteId`, `insurerQuoteId`, `resultId` fields; then `resultId + productCode + optionCode`; then legacy `productCode + optionCode` only. Resolves final `productCode` and `optionCode` for each matched plan |
+| `fetchLifeProductMasters()` | `PlanComparisonServiceImpl.java` | 226 | Calls `LifeProductCatalogueService.fetchProductMasters(broker)` → IH Product Management API `/detail-config` (Redis-cached 4h, TTL=4h). Returns `Map<"productCode|optionCode", LifeProductCatalogueMaster>` containing eligibility, terms, sum-assured limits, payout options |
+| `fetchFeatureMap()` | `PlanComparisonServiceImpl.java` | 246 | Collects all `specialFeatures` IDs from product masters of resolved plans. MongoDB `lifeProductSpecialFeatures`: queries `{ _id: { $in: [featureIds] } }`. Sorts each plan's features by `priority ASC (nulls last)` then `displayText ASC`. Returns `Map<"productCode|optionCode", List<LifeProductSpecialFeature>>` |
+| `fetchRiderPrices()` | `PlanComparisonServiceImpl.java` | 310 | Builds keys `"{productCode}_{optionCode}"` for each resolved plan (distinct). Calls `SachetLifeAggregator.getRiderPrices(referenceId, uniqueId, keys)` to fetch rider pricing. Errors are swallowed — returns empty response so comparison proceeds without rider data |
+| `fetchPartnerDetails()` | `PlanComparisonServiceImpl.java` | 334 | Calls `PartnerIntegrationService.getPartnerDetailsByPartnerId(partnerId)`. Returns `PartnerDetails` with name, email, mobile, panNo, branchCode (aadhaarNo decrypted). Errors swallowed — returns empty PartnerDetails |
+| `buildResponse()` | `PlanComparisonServiceImpl.java` | 543 | Iterates resolved plans (only `SUCCESS` status). Calls `buildPlanResultInfo()` per plan. After all plans: calls `populateKeyFeatureSections()` to fill cross-plan feature matrix, `filterPlanResultSections()` for attribute filtering, `buildPlanSectionRows()` for transposed row format. Assembles `PlanComparisonResponse` |
+| `buildPlanResultInfo()` | `PlanComparisonServiceImpl.java` | 588 | Builds the per-plan object: header fields (id, quoteId, displayName, insurerLogo), premium display (amount, frequency, `displayAmount` = premiumWithTax). Creates `options[]` list from all successful variants of same quote. Calls `buildPlanSections()` for the 5 content sections |
+| `buildPlanSections()` | `PlanComparisonServiceImpl.java` | 687 | Creates 5 sections per plan: basicDetails (coverage, terms, payout options, selected riders), keyFeatures (icon-type features — placeholder, filled by `populateKeyFeatureSections`), advancedDetails (age/PPT/frequency/SA limits from master), insurerDetails (CSR, solvency, branches from `companyDetails.lifeCompanyDetails`), availableAddons (rider coverage and premium per category from `fetchRiderPrices` result) |
+| `populateKeyFeatureSections()` | `PlanComparisonServiceImpl.java` | 872 | Unions all `LifeProductSpecialFeature` entries across all plans (sorted). For each plan: sets `value=true` if plan has that feature, `false` if not. Creates a cross-plan feature comparison matrix with `showInitialCount=5` |
+| `filterPlanResultSections()` | `PlanComparisonServiceImpl.java` | 922 | If `selectedAttributes` is provided (non-null, non-empty): removes attribute entries whose code is not in the set from every section of every plan. No-op if `selectedAttributes` is null |
+| `buildPlanSectionRows()` | `PlanComparisonServiceImpl.java` | 946 | Transposes structure from `plan → section → attribute → value` to `section → attribute → [value per plan]`. Used by UI to render a comparison table where rows are attributes and columns are plans. Empty rows (all values are NA/"-"/null) are omitted |
+| `buildAttachments()` | `PlanComparisonServiceImpl.java` | 415 | If `fileId` present: calls File Service `GET /{fileId}?broker=` to download PDF bytes. Base64 encodes → `Attachment { name=fileName, type="application/pdf", content=base64 }`. On error/empty: fallback attachment with URL instead of bytes |
+| `buildShareNotificationRequest()` | `PlanComparisonServiceImpl.java` | 439 | Builds `NotificationRequestMapper`: template `"LIFE_PLAN_COMPARISON_EMAIL_{broker}"`, subject, from address from `emailCreds`. Recipients: `to=[customerEmail]`, `cc=[partnerEmail]` (if available). Mappings include `comparisonPdfUrl`, `comparisonPreviewUrl`, `customerName`, `partnerName`, `partnerMobile`. Attaches PDF |
 
 ---
 
